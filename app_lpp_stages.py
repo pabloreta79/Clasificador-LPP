@@ -1,10 +1,12 @@
 import os
+from pathlib import Path
+
 import streamlit as st
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-# TensorFlow completo incluye tf.lite. En Streamlit Cloud suele ser lo más estable.
-# Si más adelante usás tflite-runtime, podés cambiar este import.
+# TensorFlow incluye tf.lite.Interpreter.
+# En Streamlit Cloud usar tensorflow==2.15.0 con runtime python-3.11.
 import tensorflow as tf
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -26,7 +28,9 @@ st.markdown("""
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 IMG_SIZE = 224
-MODEL_PATH = "modelo_lpp_mobilenet.tflite"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "modelo_lpp_mobilenet.tflite"
+
 CLASS_NAMES = ["stage1", "stage2", "stage3", "stage4"]
 
 STAGE_INFO = {
@@ -67,64 +71,46 @@ DISPLAY_NAMES = {
     "stage4": "Estadio IV",
 }
 
-# ── Optional Google Drive download ────────────────────────────────────────────
-def maybe_download_model_from_drive():
-    """
-    Opcional: si publicás en Streamlit Cloud y no querés subir el .tflite al repo,
-    podés definir en .streamlit/secrets.toml:
-
-    GDRIVE_FILE_ID = "tu_file_id"
-
-    y agregar gdown al requirements.txt.
-    """
-    if os.path.exists(MODEL_PATH):
-        return None
-
-    file_id = st.secrets.get("GDRIVE_FILE_ID", None) if hasattr(st, "secrets") else None
-    if not file_id:
-        return f"No se encontró `{MODEL_PATH}` en la carpeta de la app."
-
-    try:
-        import gdown
-        url = f"https://drive.google.com/uc?id={file_id}"
-        with st.spinner("Descargando modelo TFLite desde Google Drive..."):
-            gdown.download(url, MODEL_PATH, quiet=True)
-        if not os.path.exists(MODEL_PATH):
-            return "No se pudo descargar el modelo desde Google Drive."
-        return None
-    except Exception as e:
-        return f"Error descargando modelo desde Google Drive: {e}"
-
 # ── TFLite model ──────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_tflite_model():
-    err = maybe_download_model_from_drive()
-    if err:
-        return None, None, None, err
+    if not MODEL_PATH.exists():
+        return None, None, None, (
+            f"No se encontró el modelo en: {MODEL_PATH}. "
+            "El archivo modelo_lpp_mobilenet.tflite debe estar en la misma carpeta que app_lpp_stages.py."
+        )
 
     try:
-        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         return interpreter, input_details, output_details, None
+
     except Exception as e:
-        return None, None, None, str(e)
+        msg = str(e)
+        if "FULLY_CONNECTED" in msg or "builtin opcode" in msg:
+            msg += (
+                "\n\nEl modelo TFLite fue convertido con una versión de TensorFlow más nueva "
+                "que la disponible en el entorno. Reconvertí el .tflite con TensorFlow 2.15.0 "
+                "o ajustá requirements.txt/runtime.txt."
+            )
+        return None, None, None, msg
 
 
 def preprocess(img: Image.Image, input_details) -> np.ndarray:
-    """Prepara la imagen respetando el tipo de entrada del modelo TFLite."""
+    """Prepara la imagen respetando el dtype de entrada del modelo TFLite."""
     input_info = input_details[0]
     input_dtype = input_info["dtype"]
 
     arr = np.array(img.convert("RGB").resize((IMG_SIZE, IMG_SIZE)), dtype=np.float32)
 
-    # IMPORTANTE: mantener igual que el entrenamiento original.
-    # Tu app anterior usaba /255.0, por eso se mantiene.
+    # IMPORTANTE: debe coincidir con el entrenamiento.
+    # Tu entrenamiento/app original usaba /255.0.
     arr = arr / 255.0
     arr = np.expand_dims(arr, axis=0)
 
-    # Si el modelo fue cuantizado a uint8/int8, convertir usando scale/zero_point.
+    # Si el modelo fue cuantizado, convertir usando scale/zero_point.
     if input_dtype in (np.uint8, np.int8):
         scale, zero_point = input_info.get("quantization", (0.0, 0))
         if scale and scale > 0:
@@ -145,7 +131,6 @@ def predict_tflite(interpreter, input_details, output_details, image: Image.Imag
 
     output = interpreter.get_tensor(output_details[0]["index"])[0]
 
-    # Si la salida está cuantizada, des-cuantizar.
     output_info = output_details[0]
     if output_info["dtype"] in (np.uint8, np.int8):
         scale, zero_point = output_info.get("quantization", (0.0, 0))
@@ -154,8 +139,11 @@ def predict_tflite(interpreter, input_details, output_details, image: Image.Imag
 
     output = output.astype(np.float32)
 
-    # Si por algún motivo la salida no viene normalizada, aplicar softmax.
-    if not np.isclose(np.sum(output), 1.0, atol=1e-2):
+    # Normalizar solo si no parece probabilidad.
+    s = float(np.sum(output))
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError("La salida del modelo no es válida.")
+    if not np.isclose(s, 1.0, atol=1e-2):
         exp = np.exp(output - np.max(output))
         output = exp / np.sum(exp)
 
@@ -169,10 +157,7 @@ st.divider()
 # ── Model load ────────────────────────────────────────────────────────────────
 interpreter, input_details, output_details, err = load_tflite_model()
 if err:
-    st.error(
-        f"Modelo TFLite no encontrado o no cargable. Colocá `{MODEL_PATH}` en la misma carpeta "
-        f"o configurá `GDRIVE_FILE_ID` en Streamlit Secrets.\n\n`{err}`"
-    )
+    st.error(f"Modelo TFLite no encontrado o no cargable.\n\n`{err}`")
     st.stop()
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -197,8 +182,12 @@ with col2:
     st.image(image, use_container_width=True)
 
 # ── Predict ───────────────────────────────────────────────────────────────────
-with st.spinner("Analizando imagen..."):
-    preds = predict_tflite(interpreter, input_details, output_details, image)
+try:
+    with st.spinner("Analizando imagen..."):
+        preds = predict_tflite(interpreter, input_details, output_details, image)
+except Exception as e:
+    st.error(f"No se pudo ejecutar la predicción.\n\n`{e}`")
+    st.stop()
 
 if len(preds) != len(CLASS_NAMES):
     st.error(
@@ -223,11 +212,9 @@ with col_conf:
 
 st.caption(info["description"])
 
-# Baja confianza
 if confidence < 0.60:
     st.warning(f"⚡ Confianza baja ({confidence*100:.1f}%). Resultado orientativo — verificar con criterio clínico.")
 
-# Alerta clínica
 if pred_class in ("stage3", "stage4"):
     st.error(info["alert"])
 elif pred_class == "stage2":
